@@ -38,7 +38,7 @@ st.markdown("""
 st.title("✨ 권지율의 스마트 모의고사 파일 수정 프로그램")
 st.write("웹 브라우저에서 실행되어 **PC나 스마트폰 어디서든** 접속해 시험지 파일을 완벽하게 보정합니다!")
 
-# 📱 모바일 브라우저에서 PDF 파일 비활성화 방지를 위해 type 제한을 제거했습니다.
+# 파일 업로드 컴포넌트 (모바일 비활성화 방지 위해 type 제한 제거)
 uploaded_files = st.file_uploader(
     "📁 변환할 PDF 또는 이미지 파일들을 선택하거나 올려주세요", 
     accept_multiple_files=True
@@ -55,7 +55,6 @@ if uploaded_files:
         file_name = uploaded_file.name
         ext = os.path.splitext(file_name)[1].lower()
 
-        # 지원하지 않는 파일 형식인 경우 건너뛰기
         if ext not in ['.pdf', '.jpg', '.jpeg', '.png', '.bmp']:
             st.warning(f"⚠️ '{file_name}'은(는) 지원하지 않는 형식입니다. (PDF, JPG, PNG만 가능)")
             continue
@@ -90,8 +89,9 @@ if uploaded_files:
             'end': int(end_page)
         })
 
-# 비침 해결 옵션 체크박스
+# 보정 옵션 체크박스들
 remove_bleed = st.checkbox("✨ 뒷면 비침 해결 (뒷장 글씨를 하얗게 지우기)", value=True)
+enhance_faint_text = st.checkbox("✒️ 흐리고 연한 활자 진하게/선명하게 보정", value=True)
 
 def crop_and_align_paper(img):
     """불필요한 바깥 여백을 자르고, 가로형 2페이지 스프레드일 때만 중앙 제본선 정렬 적용"""
@@ -138,8 +138,8 @@ def crop_and_align_paper(img):
         pass
     return img
 
-def smart_enhance_image_np(img, remove_bleed=True):
-    """스마트 크롭 및 정렬 + 비침 해결(흰색 덮기) + 고화질 잉크 보정"""
+def smart_enhance_image_np(img, remove_bleed=True, enhance_faint_text=True):
+    """스마트 크롭 및 정렬 + 비침 해결 + 연한 활자 진하게 보정 및 선명화"""
     try:
         img = crop_and_align_paper(img)
 
@@ -165,8 +165,18 @@ def smart_enhance_image_np(img, remove_bleed=True):
         gamma_corrected = cv2.LUT(enhanced, table)
 
         final_gray = cv2.bilateralFilter(gamma_corrected, d=5, sigmaColor=30, sigmaSpace=30)
+
+        # ✒️ 연한 활자 진하게 및 선명하게(반듯하게) 보정 옵션 적용
+        if enhance_faint_text:
+            # 1. 언샤프 마스크(Unsharp Mask)로 글자 테두리를 또렷하게 선명화
+            blurred_sharp = cv2.GaussianBlur(final_gray, (0, 0), 1.5)
+            final_gray = cv2.addWeighted(final_gray, 1.6, blurred_sharp, -0.6, 0)
+            
+            # 2. 미세한 침식(Erosion) 필터를 통해 연하고 끊긴 글씨 획을 진하게 메우기
+            kernel_text = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+            final_gray = cv2.erode(final_gray, kernel_text, iterations=1)
+
         final_img = cv2.cvtColor(final_gray, cv2.COLOR_GRAY2BGR)
-        
         return Image.fromarray(final_img)
     except Exception:
         return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR))
@@ -211,7 +221,7 @@ if file_configs:
                 c = canvas.Canvas(output_pdf_path, pagesize=A4)
 
                 for img_np in all_images:
-                    pil_img = smart_enhance_image_np(img_np, remove_bleed)
+                    pil_img = smart_enhance_image_np(img_np, remove_bleed, enhance_faint_text)
                     base_margin = 0
                     usable_width = a4_width - (base_margin * 2)
                     usable_height = a4_height - (base_margin * 2)
