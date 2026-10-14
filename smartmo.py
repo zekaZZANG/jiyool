@@ -139,7 +139,7 @@ def crop_and_align_paper(img):
     return img
 
 def smart_enhance_image_np(img, remove_bleed=True, enhance_faint_text=True):
-    """스마트 크롭 및 정렬 + 비침 해결 + 뭉툭함 없는 깔끔하고 선명한 활자 보정"""
+    """스마트 크롭 및 정렬 + 비침 해결 + 픽셀 깨짐 없는 부드럽고 선명한 활자 보정"""
     try:
         img = crop_and_align_paper(img)
 
@@ -157,17 +157,22 @@ def smart_enhance_image_np(img, remove_bleed=True, enhance_faint_text=True):
         bg = cv2.morphologyEx(gray_crop, cv2.MORPH_CLOSE, kernel_bg)
         normalized = cv2.divide(gray_crop, bg, scale=255)
 
+        # CLAHE로 선명도 기초 향상
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(normalized)
+
         if enhance_faint_text:
-            # ✒️ 적응형 임계처리(Adaptive Threshold): 글씨와 배경을 깔끔하게 분리하여 지수, 루트 등 디테일이 깨지지 않고 또렷하게 유지됨
-            final_gray = cv2.adaptiveThreshold(
-                normalized, 255, 
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                cv2.THRESH_BINARY, 15, 8
-            )
+            # ✒️ 흑백으로 깨지지 않도록 회색조(Grayscale)를 유지하면서 감마 보정으로 연한 글씨를 진하게 살림
+            gamma = 0.65
+            invGamma = 1.0 / gamma
+            table = np.array([((i / 255.0) ** invGamma) * 255 for i in range(256)]).astype("uint8")
+            gamma_corrected = cv2.LUT(enhanced, table)
+            
+            # 언샤프 마스크(Unsharp Mask)로 글자 테두리를 깨끗하고 매끄럽게 정돈
+            blurred_sharp = cv2.GaussianBlur(gamma_corrected, (0, 0), 1.0)
+            final_gray = cv2.addWeighted(gamma_corrected, 1.4, blurred_sharp, -0.4, 0)
         else:
-            clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-            enhanced = clahe.apply(normalized)
-            gamma = 0.70
+            gamma = 0.75
             invGamma = 1.0 / gamma
             table = np.array([((i / 255.0) ** invGamma) * 255 for i in range(256)]).astype("uint8")
             gamma_corrected = cv2.LUT(enhanced, table)
