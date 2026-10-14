@@ -45,6 +45,48 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
+file_configs = []
+
+if uploaded_files:
+    st.markdown("---")
+    st.markdown("### 📁 파일별 페이지 범위 설정")
+    
+    for idx, uploaded_file in enumerate(uploaded_files):
+        file_bytes = uploaded_file.read()
+        file_name = uploaded_file.name
+        ext = os.path.splitext(file_name)[1].lower()
+
+        max_pages = 1
+        if ext == '.pdf':
+            try:
+                doc = fitz.open(stream=file_bytes, filetype="pdf")
+                max_pages = len(doc)
+                doc.close()
+            except:
+                max_pages = 1
+
+        # 파일 카드 박스 UI 느낌으로 표시
+        with st.container():
+            st.write(f"📄 **{file_name}** (총 {max_pages}쪽)")
+            col1, col2 = st.columns(2)
+            with col1:
+                start_page = st.number_input(
+                    "시작 페이지", min_value=1, max_value=max_pages, value=1, key=f"start_{idx}_{file_name}"
+                )
+            with col2:
+                end_page = st.number_input(
+                    "끝 페이지", min_value=1, max_value=max_pages, value=max_pages, key=f"end_{idx}_{file_name}"
+                )
+            st.markdown("")
+
+        file_configs.append({
+            'bytes': file_bytes,
+            'ext': ext,
+            'max_pages': max_pages,
+            'start': int(start_page),
+            'end': int(end_page)
+        })
+
 # 비침 해결 옵션 체크박스
 remove_bleed = st.checkbox("✨ 뒷면 비침 해결 (뒷장 글씨를 하얗게 지우기)", value=True)
 
@@ -131,14 +173,25 @@ if uploaded_files:
         with st.spinner("시험지 보정 및 PDF 생성 중입니다... 잠시만 기다려주세요!"):
             all_images = []
             
-            for uploaded_file in uploaded_files:
-                file_bytes = uploaded_file.read()
-                file_name = uploaded_file.name
-                ext = os.path.splitext(file_name)[1].lower()
+            for config in file_configs:
+                file_bytes = config['bytes']
+                ext = config['ext']
+                max_pages = config['max_pages']
+                s_val = config['start']
+                e_val = config['end']
+
+                s_idx = max(0, s_val - 1)
+                e_idx = min(max_pages - 1, e_val - 1)
+                
+                if s_idx <= e_idx:
+                    pages_to_process = list(range(s_idx, e_idx + 1))
+                else:
+                    pages_to_process = [s_idx]
 
                 if ext == '.pdf':
                     doc = fitz.open(stream=file_bytes, filetype="pdf")
-                    for page in doc:
+                    for page_index in pages_to_process:
+                        page = doc[page_index]
                         pix = page.get_pixmap(dpi=150)
                         img_np = cv2.imdecode(np.frombuffer(pix.tobytes("png"), np.uint8), cv2.IMREAD_COLOR)
                         if img_np is not None:
