@@ -605,4 +605,276 @@ with control_col:
         value=False,
     )
 
-    with st.expander
+    with st.expander("세부 설정", expanded=False):
+        background_strength = st.slider(
+            "배경 보정 강도",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.65,
+            step=0.05,
+        )
+
+        dpi = st.select_slider(
+            "출력 해상도",
+            options=[150, 200, 250, 300, 350],
+            value=250,
+        )
+
+        st.caption(
+            "DPI가 높을수록 처리 시간과 메모리 사용량이 증가합니다."
+        )
+
+    settings = {
+        "deskew": deskew,
+        "perspective": perspective,
+        "background": background,
+        "background_strength": background_strength,
+        "denoise": denoise,
+        "sharpen": sharpen,
+        "contrast": contrast,
+    }
+
+
+with preview_col:
+    st.subheader("👁️ 미리보기")
+
+    if end_page >= start_page:
+        preview_page = st.number_input(
+            "미리 볼 페이지",
+            min_value=int(start_page),
+            max_value=int(end_page),
+            value=int(start_page),
+            step=1,
+        )
+
+        original_preview_col, result_preview_col = st.columns(2)
+
+        try:
+            original_preview = render_page(
+                source_doc[int(preview_page) - 1],
+                dpi=150,
+            )
+
+            processed_preview = process_image(
+                original_preview,
+                settings,
+            )
+
+            with original_preview_col:
+                st.caption("원본")
+                st.image(
+                    original_preview,
+                    use_container_width=True,
+                )
+
+            with result_preview_col:
+                st.caption("복원 결과")
+                st.image(
+                    processed_preview,
+                    use_container_width=True,
+                )
+
+        except Exception as exc:
+            st.error(
+                f"미리보기에 실패했습니다: {exc}"
+            )
+
+    else:
+        st.warning(
+            "끝 페이지는 시작 페이지보다 작을 수 없습니다."
+        )
+
+
+# =========================
+# 실행 및 다운로드
+# =========================
+
+st.divider()
+
+valid_range = (
+    int(start_page) <= int(end_page)
+)
+
+run_col, info_col = st.columns(
+    [1, 2],
+    vertical_alignment="center",
+)
+
+with run_col:
+    run_button = st.button(
+        "🚀 PDF 복원 시작",
+        type="primary",
+        use_container_width=True,
+        disabled=not valid_range,
+    )
+
+with info_col:
+    st.caption(
+        "페이지를 병렬 처리합니다. 고해상도 또는 긴 PDF는 시간이 걸릴 수 있습니다."
+    )
+
+
+if run_button:
+    selected_indices = list(
+        range(
+            int(start_page) - 1,
+            int(end_page),
+        )
+    )
+
+    total = len(selected_indices)
+    results_by_index = {}
+    failures = []
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    max_workers = get_max_workers(total)
+
+    status.info(
+        f"{total}페이지 처리 시작 · 동시 작업 {max_workers}개"
+    )
+
+    with ThreadPoolExecutor(
+        max_workers=max_workers
+    ) as executor:
+
+        futures = {
+            executor.submit(
+                process_single_page,
+                pdf_bytes,
+                page_index,
+                int(dpi),
+                settings,
+            ): page_index
+            for page_index in selected_indices
+        }
+
+        completed = 0
+
+        for future in as_completed(futures):
+            page_index = futures[future]
+
+            try:
+                result = future.result()
+
+            except Exception as exc:
+                result = {
+                    "index": page_index,
+                    "image": None,
+                    "size": None,
+                    "error": str(exc),
+                }
+
+            if result["error"] is not None:
+                failures.append(
+                    (
+                        page_index + 1,
+                        result["error"],
+                    )
+                )
+
+                # 오류 발생 시 해당 페이지는 원본 렌더링으로 대체한다.
+                try:
+                    fallback_doc = fitz.open(
+                        stream=pdf_bytes,
+                        filetype="pdf",
+                    )
+
+                    fallback_page = fallback_doc[
+                        page_index
+                    ]
+
+                    fallback_image = render_page(
+                        fallback_page,
+                        dpi=int(dpi),
+                    )
+
+                    fallback_size = (
+                        fallback_page.rect.width,
+                        fallback_page.rect.height,
+                    )
+
+                    fallback_doc.close()
+
+                    result["image"] = fallback_image
+                    result["size"] = fallback_size
+
+                except Exception as fallback_exc:
+                    status.error(
+                        f"{page_index + 1}페이지 복원 및 대체 처리 실패: "
+                        f"{fallback_exc}"
+                    )
+                    continue
+
+            results_by_index[page_index] = result
+
+            completed += 1
+
+            progress.progress(
+                completed / total
+            )
+
+            status.write(
+                f"페이지 처리 중: {completed}/{total}"
+            )
+
+    # 원래 페이지 순서로 정렬
+    ordered_results = [
+        results_by_index[index]
+        for index in selected_indices
+        if index in results_by_index
+        and results_by_index[index]["image"] is not None
+    ]
+
+    if len(ordered_results) != total:
+        st.error(
+            "일부 페이지를 처리하지 못했습니다. "
+            "PDF를 다시 업로드하거나 해상도를 낮춰 시도하세요."
+        )
+
+    elif ordered_results:
+        try:
+            result_pdf = images_to_pdf(
+                ordered_results,
+                source_doc,
+            )
+
+            base_name = Path(
+                selected_file.name
+            ).stem
+
+            output_name = (
+                f"{base_name}_"
+                f"{start_page}-{end_page}_restored.pdf"
+            )
+
+            status.success(
+                f"완료! {len(ordered_results)}페이지 처리"
+            )
+
+            if failures:
+                with st.expander(
+                    "일부 페이지의 처리 오류 확인"
+                ):
+                    for page_no, message in failures:
+                        st.write(
+                            f"- {page_no}페이지: {message}"
+                        )
+
+            st.download_button(
+                "📥 복원된 PDF 다운로드",
+                data=result_pdf,
+                file_name=output_name,
+                mime="application/pdf",
+                type="primary",
+                use_container_width=True,
+            )
+
+        except Exception as exc:
+            st.error(
+                f"PDF 생성에 실패했습니다: {exc}"
+            )
+
+
+source_doc.close()
