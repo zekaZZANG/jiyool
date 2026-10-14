@@ -36,7 +36,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("✨ 권지율의 스마트 모의고사 파일 수정 프로그램")
-st.write("웹 브라우저에서 실행되어 **PC나 스마트폰 어디서든** 접속해 시험지 파일을 완벽하게 복원합니다!")
+st.write("웹 브라우저에서 실행되어 **PC나 스마트폰 어디서든** 접속해 시험지 파일을 완벽하게 보정합니다!")
 
 # 📱 모바일 브라우저에서 PDF 파일 비활성화 방지를 위해 type 제한 제거
 uploaded_files = st.file_uploader(
@@ -93,9 +93,9 @@ if uploaded_files:
 st.markdown("---")
 col_opt1, col_opt2 = st.columns(2)
 with col_opt1:
-    remove_bleed = st.checkbox("✨ 뒷면 비침 및 그림자 완벽 제거", value=True)
+    remove_bleed = st.checkbox("✨ 선명도 및 가독성 향상", value=True)
 with col_opt2:
-    straighten_top_line_opt = st.checkbox("📐 상단 가로선 기준 수평 맞춤", value=True)
+    straighten_top_line_opt = st.checkbox("📐 상단 가로선 기준 수평 맞춤", value=False)
 
 def straighten_exam_by_top_line(img):
     """시험지 상단 영역의 가로선을 탐지하여 기울어진 각도를 계산하고 수평으로 맞춥니다."""
@@ -141,7 +141,7 @@ def crop_and_align_paper(img):
             area = cv2.contourArea(largest_contour)
             if area > (h * w * 0.25):
                 x, y, bw, bh = cv2.boundingRect(largest_contour)
-                inset = 6
+                inset = 4
                 x = max(0, x + inset)
                 y = max(0, y + inset)
                 bw = min(w - x, bw - (inset * 2))
@@ -171,46 +171,30 @@ def crop_and_align_paper(img):
         pass
     return img
 
-def ultimate_restore_image(img, remove_bleed=True, straighten_top=True):
-    """시험지 완전복원 파이프라인: 수평 맞춤 -> 조명 균일화 및 그림자 제거 -> 이진화 및 잉크 극대화"""
+def safe_high_fidelity_enhance(img, enhance=True, straighten_top=False):
+    """수식, 폰트, 기호를 100% 보존하면서 깔끔하게 렌더링하는 비파괴 고화질 보정 함수"""
     try:
         if straighten_top:
             img = straighten_exam_by_top_line(img)
             
         img = crop_and_align_paper(img)
 
-        h, w = img.shape[:2]
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        if remove_bleed:
-            # 1단계: 넓은 커널로 배경 조명 맵 추출 (그림자 및 누런 배경 제거)
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 35))
-            bg = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
-            
-            # 조명 정규화 (배경을 완전 흰색으로 만듦)
-            norm = cv2.divide(gray, bg, scale=255)
-            
-            # 2단계: 뒷면 비침 잔여물 제거
-            diff = cv2.absdiff(bg, gray)
-            norm[diff < 15] = 255
+        if enhance:
+            # 글자를 뭉개는 강한 이진화 대신, 부드러운 CLAHE 명암비 조절과 양방향 필터로 가독성만 높임
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+            smoothed = cv2.bilateralFilter(enhanced, d=3, sigmaColor=15, sigmaSpace=15)
+            final_img = cv2.cvtColor(smoothed, cv2.COLOR_GRAY2BGR)
+            return Image.fromarray(final_img)
         else:
-            norm = gray
-
-        # 3단계: 가우시안 블러 및 오츠(Otsu) + 적응형 이진화로 글씨를 인쇄물처럼 또렷하게 선명화
-        blurred = cv2.GaussianBlur(norm, (3, 3), 0)
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        # 4단계: 노이즈 제거 및 엣지 정돈
-        cleaned = cv2.bilateralFilter(thresh, d=5, sigmaColor=25, sigmaSpace=25)
-        
-        final_img = cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR)
-        return Image.fromarray(final_img)
+            return Image.fromarray(img)
     except Exception:
         return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR))
 
 if file_configs:
-    if st.button("🚀 시험지 완전복원 및 초고화질 PDF 생성"):
-        with st.spinner("시험지 배경 제거, 그림자 보정 및 수식 완전복원 중입니다... 잠시만 기다려주세요!"):
+    if st.button("🚀 수식 깨짐 없는 고화질 PDF 생성"):
+        with st.spinner("수식과 폰트를 완벽하게 보존하며 PDF 생성 중입니다... 잠시만 기다려주세요!"):
             all_images = []
             
             for config in file_configs:
@@ -232,7 +216,7 @@ if file_configs:
                     doc = fitz.open(stream=file_bytes, filetype="pdf")
                     for page_index in pages_to_process:
                         page = doc[page_index]
-                        # 300 DPI로 고해상도 렌더링하여 수식과 선이 깨지지 않도록 함
+                        # 300 DPI 초고해상도 렌더링 유지
                         pix = page.get_pixmap(dpi=300)
                         img_np = cv2.imdecode(np.frombuffer(pix.tobytes("png"), np.uint8), cv2.IMREAD_COLOR)
                         if img_np is not None:
@@ -244,12 +228,12 @@ if file_configs:
                         all_images.append(img_np)
 
             if len(all_images) > 0:
-                output_pdf_path = "권지율의_불꽃모의고사_완전복원.pdf"
+                output_pdf_path = "권지율의_불꽃모의고사_완벽보존.pdf"
                 a4_width, a4_height = A4
                 c = canvas.Canvas(output_pdf_path, pagesize=A4)
 
                 for img_np in all_images:
-                    pil_img = ultimate_restore_image(img_np, remove_bleed, straighten_top_line_opt)
+                    pil_img = safe_high_fidelity_enhance(img_np, remove_bleed, straighten_top_line_opt)
                     base_margin = 0
                     usable_width = a4_width - (base_margin * 2)
                     usable_height = a4_height - (base_margin * 2)
@@ -275,12 +259,12 @@ if file_configs:
                 with open(output_pdf_path, "rb") as f:
                     pdf_data = f.read()
 
-                st.success("✨ 시험지 완전복원이 성공적으로 완료되었습니다!")
+                st.success("✨ 수식 깨짐 없이 완벽하게 변환되었습니다!")
                 
                 st.download_button(
-                    label="📥 완전복원된 모의고사 PDF 다운로드",
+                    label="📥 완벽 보존된 모의고사 PDF 다운로드",
                     data=pdf_data,
-                    file_name="권지율의_불꽃모의고사_완전복원.pdf",
+                    file_name="권지율의_불꽃모의고사_완벽보존.pdf",
                     mime="application/pdf"
                 )
             else:
