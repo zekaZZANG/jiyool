@@ -2,6 +2,7 @@
 import io
 import math
 import os
+import hashlib
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -25,6 +26,16 @@ st.set_page_config(
 
 cv2.setUseOptimized(True)
 
+if "result_pdf" not in st.session_state:
+    st.session_state["result_pdf"] = None
+
+if "result_name" not in st.session_state:
+    st.session_state["result_name"] = None
+
+if "result_key" not in st.session_state:
+    st.session_state["result_key"] = None
+
+
 st.markdown(
     """
     <style>
@@ -42,7 +53,10 @@ st.markdown(
 )
 
 st.title("📄 시험지 PDF 복원")
-st.caption("빠른 기울기 보정 · 내용 중앙 정렬 · 배경 개선 · 고화질 PDF 저장")
+st.caption(
+    "기울기 보정 · 내용 중앙 정렬 · 뒷장 비침 감소 · "
+    "배경 백색화 · 글자 선명도 개선"
+)
 
 
 # =========================
@@ -71,8 +85,6 @@ def render_page(page, dpi=200):
 
 def estimate_skew_angle(gray):
     h, w = gray.shape
-
-    # 작은 이미지에서 각도를 추정해 연산량을 줄인다.
     target_w = min(w, 900)
 
     if w > target_w:
@@ -108,9 +120,9 @@ def estimate_skew_angle(gray):
             math.atan2(y2 - y1, x2 - x1)
         )
 
-        if -10 <= angle <= 10:
-            length = math.hypot(x2 - x1, y2 - y1)
+        length = math.hypot(x2 - x1, y2 - y1)
 
+        if -10 <= angle <= 10:
             if length >= small.shape[1] * 0.08:
                 angles.append(angle)
 
@@ -148,21 +160,16 @@ def rotate_bound(image, angle):
 
 
 # =========================
-# 내용 영역 검출 및 중앙 정렬
+# 내용 중앙 정렬
 # =========================
 
-def center_content(image, threshold=225):
-    """
-    어두운 글자와 선을 이용해 내용 영역을 찾는다.
-    내용 영역을 페이지 중앙으로 이동하되 잘라내지 않는다.
-    """
+def center_content(image):
     h, w = image.shape[:2]
 
     gray = cv2.cvtColor(
         image, cv2.COLOR_RGB2GRAY
     )
 
-    # 가장자리의 스캔 테두리가 검출을 방해하지 않도록 제외한다.
     margin_y = max(2, int(h * 0.015))
     margin_x = max(2, int(w * 0.015))
 
@@ -174,43 +181,32 @@ def center_content(image, threshold=225):
     if inner.size == 0:
         return image
 
+    # 어두운 글자와 선을 검출한다.
     mask = cv2.threshold(
         inner,
-        threshold,
+        215,
         255,
         cv2.THRESH_BINARY_INV,
     )[1]
 
-    # 작은 점이나 스캔 노이즈 제거
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        mask, connectivity=8
-    )
-
-    clean = np.zeros_like(mask)
-
-    min_area = max(4, int(h * w * 0.0000005))
-
-    for i in range(1, count):
-        x, y, cw, ch, area = stats[i]
-
-        if area >= min_area:
-            clean[labels == i] = 255
-
-    points = cv2.findNonZero(clean)
+    points = cv2.findNonZero(mask)
 
     if points is None:
         return image
 
     x, y, bw, bh = cv2.boundingRect(points)
 
+    # 페이지 전체가 내용으로 잡힌 경우 이동하지 않는다.
+    if bw > inner.shape[1] * 0.97:
+        return image
+
+    if bh > inner.shape[0] * 0.97:
+        return image
+
     x1 = x + margin_x
     y1 = y + margin_y
     x2 = x1 + bw
     y2 = y1 + bh
-
-    # 내용이 거의 전체 페이지를 차지하면 이동하지 않는다.
-    if bw > w * 0.96 or bh > h * 0.96:
-        return image
 
     content_cx = (x1 + x2) / 2
     content_cy = (y1 + y2) / 2
@@ -218,7 +214,6 @@ def center_content(image, threshold=225):
     dx = int(round(w / 2 - content_cx))
     dy = int(round(h / 2 - content_cy))
 
-    # 이미 충분히 중앙에 있으면 불필요하게 재처리하지 않는다.
     if abs(dx) < w * 0.005 and abs(dy) < h * 0.005:
         return image
 
@@ -238,17 +233,24 @@ def center_content(image, threshold=225):
 
 
 # =========================
-# 빠른 배경 보정
+# 자동 배경 백색화 및 뒷장 비침 감소
 # =========================
 
-def normalize_background(image, strength=0.5):
+def remove_bleed_and_whiten(image, strength=0.65):
+    """
+    종이의 불균일한 밝기를 보정하고,
+    어두운 앞면 글자는 최대한 보존하면서
+    옅은 회색 배경과 뒷장 비침을 줄인다.
+
+    이 기능은 별도 체크박스 없이 항상 적용한다.
+    """
     gray = cv2.cvtColor(
         image, cv2.COLOR_RGB2GRAY
     )
 
     h, w = gray.shape
 
-    # 저해상도에서 배경을 추정한 후 원래 크기로 복원한다.
+    # 작은 이미지에서 배경 밝기를 추정해 계산량을 줄인다.
     small_w = max(1, w // 4)
     small_h = max(1, h // 4)
 
@@ -259,7 +261,10 @@ def normalize_background(image, strength=0.5):
     )
 
     background_small = cv2.GaussianBlur(
-        small, (0, 0), sigmaX=9, sigmaY=9
+        small,
+        (0, 0),
+        sigmaX=9,
+        sigmaY=9,
     )
 
     background = cv2.resize(
@@ -270,21 +275,51 @@ def normalize_background(image, strength=0.5):
 
     background = np.maximum(background, 30)
 
+    # 국소 배경 밝기에 맞춰 회색 종이를 보정한다.
     corrected = (
         gray.astype(np.float32)
         * (245.0 / background)
     )
 
-    corrected = np.clip(corrected, 0, 255)
+    corrected = np.clip(
+        corrected, 0, 255
+    ).astype(np.uint8)
 
-    result = (
-        gray.astype(np.float32) * (1 - strength)
-        + corrected * strength
+    # 밝은 영역을 흰색에 가깝게 매핑한다.
+    # 진한 글자와 선은 비교적 그대로 유지한다.
+    lut = np.arange(256, dtype=np.float32)
+
+    start = 150.0
+    end = 220.0
+
+    middle = (
+        start
+        + (lut - start)
+        * ((255.0 - start) / (end - start))
     )
 
-    result = np.clip(
-        result, 0, 255
-    ).astype(np.uint8)
+    lut = np.where(
+        lut <= start,
+        lut,
+        np.where(
+            lut >= end,
+            255.0,
+            middle,
+        ),
+    )
+
+    lut = np.clip(lut, 0, 255).astype(np.uint8)
+
+    whitened = cv2.LUT(corrected, lut)
+
+    # 강도에 따라 원본 대비 보정량을 조절한다.
+    result = cv2.addWeighted(
+        corrected,
+        1.0 - strength,
+        whitened,
+        strength,
+        0,
+    )
 
     return cv2.cvtColor(
         result, cv2.COLOR_GRAY2RGB
@@ -311,11 +346,11 @@ def process_image(image, settings):
     if settings["center"]:
         result = center_content(result)
 
-    if settings["background"]:
-        result = normalize_background(
-            result,
-            settings["background_strength"],
-        )
+    # 항상 자동 적용: 별도 체크박스 없음
+    result = remove_bleed_and_whiten(
+        result,
+        settings["background_strength"],
+    )
 
     if settings["denoise"]:
         gray = cv2.cvtColor(
@@ -340,8 +375,10 @@ def process_image(image, settings):
         )
 
         result = cv2.addWeighted(
-            result, 1.2,
-            blurred, -0.2,
+            result,
+            1.2,
+            blurred,
+            -0.2,
             0,
         )
 
@@ -349,7 +386,7 @@ def process_image(image, settings):
 
 
 # =========================
-# 미리보기 캐싱
+# 캐시된 미리보기
 # =========================
 
 @st.cache_data(show_spinner=False, max_entries=12)
@@ -357,23 +394,26 @@ def make_preview(pdf_bytes, page_index, settings_key):
     settings = dict(settings_key)
 
     with fitz.open(
-        stream=pdf_bytes, filetype="pdf"
+        stream=pdf_bytes,
+        filetype="pdf",
     ) as doc:
         image = render_page(
-            doc[page_index], dpi=100
+            doc[page_index],
+            dpi=100,
         )
 
     return process_image(image, settings)
 
 
 # =========================
-# 페이지 병렬 처리
+# 병렬 페이지 처리
 # =========================
 
 def process_single_page(pdf_bytes, page_index, dpi, settings):
     try:
         with fitz.open(
-            stream=pdf_bytes, filetype="pdf"
+            stream=pdf_bytes,
+            filetype="pdf",
         ) as doc:
             page = doc[page_index]
 
@@ -382,7 +422,10 @@ def process_single_page(pdf_bytes, page_index, dpi, settings):
                 page.rect.height,
             )
 
-            image = render_page(page, dpi=dpi)
+            image = render_page(
+                page,
+                dpi=dpi,
+            )
 
         image = process_image(image, settings)
 
@@ -404,8 +447,6 @@ def process_single_page(pdf_bytes, page_index, dpi, settings):
 
 def get_max_workers(page_count):
     cpu_count = os.cpu_count() or 2
-
-    # 메모리 폭증을 막기 위해 동시 작업 수를 제한한다.
     return max(1, min(page_count, cpu_count, 3))
 
 
@@ -423,8 +464,10 @@ def images_to_pdf(results):
 
             buffer = io.BytesIO()
 
-            # PNG 압축 시간을 줄인다. 이미지 품질은 유지된다.
-            Image.fromarray(result["image"]).save(
+            # 빠른 PNG 압축. 이미지 해상도는 유지한다.
+            Image.fromarray(
+                result["image"]
+            ).save(
                 buffer,
                 format="PNG",
                 compress_level=1,
@@ -445,7 +488,7 @@ def images_to_pdf(results):
 
 
 # =========================
-# 사용자 인터페이스
+# 업로드
 # =========================
 
 uploaded_files = st.file_uploader(
@@ -464,12 +507,16 @@ file_names = [
 ]
 
 selected_label = st.selectbox(
-    "처리할 PDF", file_names
+    "처리할 PDF",
+    file_names,
 )
 
 selected_index = file_names.index(selected_label)
 selected_file = uploaded_files[selected_index]
 pdf_bytes = selected_file.getvalue()
+
+# 파일이 바뀌면 이전 파일의 다운로드 결과를 무효화한다.
+file_hash = hashlib.sha256(pdf_bytes).hexdigest()
 
 try:
     source_doc = fitz.open(
@@ -483,8 +530,21 @@ except Exception as exc:
 page_count = len(source_doc)
 
 m1, m2 = st.columns(2)
-m1.metric("전체 페이지", f"{page_count}페이지")
-m2.metric("파일 크기", f"{len(pdf_bytes) / 1048576:.1f} MB")
+
+m1.metric(
+    "전체 페이지",
+    f"{page_count}페이지",
+)
+
+m2.metric(
+    "파일 크기",
+    f"{len(pdf_bytes) / 1048576:.1f} MB",
+)
+
+
+# =========================
+# 설정 및 미리보기
+# =========================
 
 control_col, preview_col = st.columns([0.9, 1.5])
 
@@ -511,16 +571,33 @@ with control_col:
             step=1,
         )
 
-    deskew = st.checkbox("기울기 보정", value=True)
-    center = st.checkbox("내용 중앙 정렬", value=True)
-    background = st.checkbox("배경 백색화", value=True)
-    sharpen = st.checkbox("글자 선명도 개선", value=True)
-    denoise = st.checkbox("노이즈 제거 (느릴 수 있음)", value=False)
+    deskew = st.checkbox(
+        "기울기 보정",
+        value=True,
+    )
+
+    center = st.checkbox(
+        "내용 중앙 정렬",
+        value=True,
+    )
+
+    sharpen = st.checkbox(
+        "글자 선명도 개선",
+        value=True,
+    )
+
+    denoise = st.checkbox(
+        "노이즈 제거 (느릴 수 있음)",
+        value=False,
+    )
 
     with st.expander("세부 설정"):
         background_strength = st.slider(
-            "배경 보정 강도",
-            0.0, 1.0, 0.5, 0.05,
+            "배경 백색화 및 비침 감소 강도",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.65,
+            step=0.05,
         )
 
         dpi = st.select_slider(
@@ -529,13 +606,17 @@ with control_col:
             value=200,
         )
 
+        st.caption(
+            "비침 감소는 자동 적용돼. 강도를 높이면 "
+            "옅은 글씨도 함께 희미해질 수 있어."
+        )
+
     settings = {
         "deskew": deskew,
         "center": center,
-        "background": background,
-        "background_strength": background_strength,
         "sharpen": sharpen,
         "denoise": denoise,
+        "background_strength": background_strength,
     }
 
     settings_key = tuple(sorted(settings.items()))
@@ -584,7 +665,29 @@ with preview_col:
             st.error(f"미리보기 오류: {exc}")
 
     else:
-        st.warning("끝 페이지는 시작 페이지보다 작을 수 없어.")
+        st.warning(
+            "끝 페이지는 시작 페이지보다 작을 수 없어."
+        )
+
+
+# =========================
+# 다운로드 식별 키
+# =========================
+
+job_key = hashlib.sha256(
+    repr((
+        file_hash,
+        int(start_page),
+        int(end_page),
+        int(dpi),
+        settings_key,
+    )).encode("utf-8")
+).hexdigest()
+
+
+# =========================
+# 실행
+# =========================
 
 st.divider()
 
@@ -597,7 +700,10 @@ if st.button(
     disabled=not valid_range,
 ):
     selected_indices = list(
-        range(int(start_page) - 1, int(end_page))
+        range(
+            int(start_page) - 1,
+            int(end_page),
+        )
     )
 
     total = len(selected_indices)
@@ -628,7 +734,8 @@ if st.button(
         }
 
         for completed, future in enumerate(
-            as_completed(futures), start=1
+            as_completed(futures),
+            start=1,
         ):
             index = futures[future]
 
@@ -647,18 +754,23 @@ if st.button(
                     (index + 1, result["error"])
                 )
 
-                # 실패한 페이지는 보정을 적용하지 않은 원본으로 대체한다.
+                # 처리 실패 시 원본 페이지 이미지로 대체한다.
                 try:
                     with fitz.open(
                         stream=pdf_bytes,
                         filetype="pdf",
                     ) as fallback_doc:
                         page = fallback_doc[index]
+
                         size = (
                             page.rect.width,
                             page.rect.height,
                         )
-                        image = render_page(page, dpi=int(dpi))
+
+                        image = render_page(
+                            page,
+                            dpi=int(dpi),
+                        )
 
                     result.update({
                         "image": image,
@@ -667,8 +779,12 @@ if st.button(
 
                 except Exception as fallback_exc:
                     failures.append(
-                        (index + 1, f"원본 대체 실패: {fallback_exc}")
+                        (
+                            index + 1,
+                            f"원본 대체 실패: {fallback_exc}",
+                        )
                     )
+
                     progress.progress(completed / total)
                     continue
 
@@ -689,40 +805,71 @@ if st.button(
     if len(ordered_results) != total:
         st.error(
             "일부 페이지를 처리하지 못했어. "
-            "해상도를 낮추거나 오류 내용을 확인해 줘."
+            "오류 내용을 확인하거나 해상도를 낮춰 줘."
         )
 
     elif ordered_results:
         try:
-            status.info("PDF 파일 생성 중...")
+            status.info("PDF 생성 중...")
 
             result_pdf = images_to_pdf(ordered_results)
 
-            base_name = Path(selected_file.name).stem
+            base_name = Path(
+                selected_file.name
+            ).stem
 
             output_name = (
                 f"{base_name}_{start_page}-{end_page}_restored.pdf"
             )
 
+            # 다운로드 버튼이 다시 실행되어도 결과를 유지한다.
+            st.session_state["result_pdf"] = result_pdf
+            st.session_state["result_name"] = output_name
+            st.session_state["result_key"] = job_key
+            st.session_state["result_failures"] = failures
+
             status.success(
                 f"완료! {len(ordered_results)}페이지 처리"
             )
 
-            if failures:
-                with st.expander("일부 페이지의 처리 오류 확인"):
-                    for page_no, message in failures:
-                        st.write(f"- {page_no}페이지: {message}")
-
-            st.download_button(
-                "📥 복원된 PDF 다운로드",
-                data=result_pdf,
-                file_name=output_name,
-                mime="application/pdf",
-                type="primary",
-                use_container_width=True,
-            )
-
         except Exception as exc:
             st.error(f"PDF 생성에 실패했어: {exc}")
+
+
+# =========================
+# 다운로드 버튼
+# 실행 버튼과 분리해 결과를 유지한다.
+# =========================
+
+if (
+    st.session_state.get("result_pdf") is not None
+    and st.session_state.get("result_key") == job_key
+):
+    st.success("복원된 PDF를 다운로드할 수 있어.")
+
+    failures = st.session_state.get(
+        "result_failures", []
+    )
+
+    if failures:
+        with st.expander("일부 페이지의 처리 오류 확인"):
+            for page_no, message in failures:
+                st.write(f"- {page_no}페이지: {message}")
+
+    st.download_button(
+        label="📥 복원된 PDF 다운로드",
+        data=st.session_state["result_pdf"],
+        file_name=st.session_state["result_name"],
+        mime="application/pdf",
+        type="primary",
+        use_container_width=True,
+        key=f"download_{job_key}",
+    )
+
+elif st.session_state.get("result_pdf") is not None:
+    st.caption(
+        "현재 파일 또는 설정이 이전 결과와 달라졌어. "
+        "새 PDF를 복원하면 다운로드 버튼이 표시돼."
+    )
 
 source_doc.close()
