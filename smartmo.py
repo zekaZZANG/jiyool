@@ -139,7 +139,7 @@ def crop_and_align_paper(img):
     return img
 
 def smart_enhance_image_np(img, remove_bleed=True, enhance_faint_text=True):
-    """스마트 크롭 및 정렬 + 비침 해결 + 연한 활자 진하게 보정 및 선명화"""
+    """스마트 크롭 및 정렬 + 비침 해결 + 뭉툭함 없는 깔끔하고 선명한 활자 보정"""
     try:
         img = crop_and_align_paper(img)
 
@@ -152,29 +152,26 @@ def smart_enhance_image_np(img, remove_bleed=True, enhance_faint_text=True):
             diff = cv2.absdiff(bg_bleed, gray_crop)
             gray_crop[diff < 18] = 255
 
+        # 배경 균일화 (그림자 및 얼룩 제거)
         kernel_bg = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
         bg = cv2.morphologyEx(gray_crop, cv2.MORPH_CLOSE, kernel_bg)
         normalized = cv2.divide(gray_crop, bg, scale=255)
 
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-        enhanced = clahe.apply(normalized)
-
-        gamma = 0.70
-        invGamma = 1.0 / gamma
-        table = np.array([((i / 255.0) ** invGamma) * 255 for i in range(256)]).astype("uint8")
-        gamma_corrected = cv2.LUT(enhanced, table)
-
-        final_gray = cv2.bilateralFilter(gamma_corrected, d=5, sigmaColor=30, sigmaSpace=30)
-
-        # ✒️ 연한 활자 진하게 및 선명하게(반듯하게) 보정 옵션 적용
         if enhance_faint_text:
-            # 1. 언샤프 마스크(Unsharp Mask)로 글자 테두리를 또렷하게 선명화
-            blurred_sharp = cv2.GaussianBlur(final_gray, (0, 0), 1.5)
-            final_gray = cv2.addWeighted(final_gray, 1.6, blurred_sharp, -0.6, 0)
-            
-            # 2. 미세한 침식(Erosion) 필터를 통해 연하고 끊긴 글씨 획을 진하게 메우기
-            kernel_text = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-            final_gray = cv2.erode(final_gray, kernel_text, iterations=1)
+            # ✒️ 적응형 임계처리(Adaptive Threshold): 글씨와 배경을 깔끔하게 분리하여 지수, 루트 등 디테일이 깨지지 않고 또렷하게 유지됨
+            final_gray = cv2.adaptiveThreshold(
+                normalized, 255, 
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                cv2.THRESH_BINARY, 15, 8
+            )
+        else:
+            clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+            enhanced = clahe.apply(normalized)
+            gamma = 0.70
+            invGamma = 1.0 / gamma
+            table = np.array([((i / 255.0) ** invGamma) * 255 for i in range(256)]).astype("uint8")
+            gamma_corrected = cv2.LUT(enhanced, table)
+            final_gray = cv2.bilateralFilter(gamma_corrected, d=5, sigmaColor=30, sigmaSpace=30)
 
         final_img = cv2.cvtColor(final_gray, cv2.COLOR_GRAY2BGR)
         return Image.fromarray(final_img)
