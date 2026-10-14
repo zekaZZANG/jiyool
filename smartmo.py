@@ -92,13 +92,65 @@ if uploaded_files:
 # 보정 옵션 체크박스들
 remove_bleed = st.checkbox("✨ 뒷면 비침 해결 (뒷장 글씨를 하얗게 지우기)", value=True)
 enhance_faint_text = st.checkbox("✒️ 흐리고 연한 활자 진하게/선명하게 보정", value=True)
+correct_perspective = st.checkbox("📐 구겨진 시험지 왜곡 펴기 및 반듯하게 정렬", value=True)
 
-def crop_and_align_paper(img):
-    """불필요한 바깥 여백을 자르고, 가로형 2페이지 스프레드일 때만 중앙 제본선 정렬 적용"""
+def order_points(pts):
+    """네 모서리 좌표 순서 정렬 (좌상, 우상, 우하, 좌하)"""
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+def four_point_transform(image, pts):
+    """모서리 좌표를 바탕으로 왜곡된 종이를 반듯한 직사각형으로 투시 변환"""
+    rect = order_points(pts)
+    (tl, tr, br, bl) = rect
+
+    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+    maxWidth = max(int(widthA), int(widthB))
+
+    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+    maxHeight = max(int(heightA), int(heightB))
+
+    dst = np.array([
+        [0, 0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]
+    ], dtype="float32")
+
+    M = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight), borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+    return warped
+
+def crop_and_align_paper(img, correct_perspective=True):
+    """구겨진 시험지 투시 왜곡 펴기 + 여백 자르기 + 스프레드 정렬"""
     try:
         h, w = img.shape[:2]
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
+        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if correct_perspective and contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            area = cv2.contourArea(largest_contour)
+            if area > (h * w * 0.2):
+                peri = cv2.arcLength(largest_contour, True)
+                approx = cv2.approxPolyDP(largest_contour, 0.02 * peri, True)
+                if len(approx) == 4:
+                    pts = approx.reshape(4, 2)
+                    img = four_point_transform(img, pts)
+                    h, w = img.shape[:2]
+
+        # 바깥 여백 깔끔하게 정리
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (7, 7), 0)
         _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -117,6 +169,7 @@ def crop_and_align_paper(img):
                 if bw > w * 0.4 and bh > h * 0.4:
                     img = img[y:y+bh, x:x+bw]
 
+        # 가로형 2페이지 스프레드 중앙 제본선 정렬
         h2, w2 = img.shape[:2]
         if w2 > h2 * 1.1:
             gray2 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -138,10 +191,10 @@ def crop_and_align_paper(img):
         pass
     return img
 
-def smart_enhance_image_np(img, remove_bleed=True, enhance_faint_text=True):
-    """스마트 크롭 및 정렬 + 비침 해결 + 픽셀 깨짐 없는 부드럽고 선명한 활자 보정"""
+def smart_enhance_image_np(img, remove_bleed=True, enhance_faint_text=True, correct_perspective=True):
+    """스마트 보정 파이프라인 (왜곡 펴기 + 비침 해결 + 선명도 개선)"""
     try:
-        img = crop_and_align_paper(img)
+        img = crop_and_align_paper(img, correct_perspective)
 
         h, w = img.shape[:2]
         gray_crop = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -152,23 +205,19 @@ def smart_enhance_image_np(img, remove_bleed=True, enhance_faint_text=True):
             diff = cv2.absdiff(bg_bleed, gray_crop)
             gray_crop[diff < 18] = 255
 
-        # 배경 균일화 (그림자 및 얼룩 제거)
         kernel_bg = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
         bg = cv2.morphologyEx(gray_crop, cv2.MORPH_CLOSE, kernel_bg)
         normalized = cv2.divide(gray_crop, bg, scale=255)
 
-        # CLAHE로 선명도 기초 향상
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(normalized)
 
         if enhance_faint_text:
-            # ✒️ 흑백으로 깨지지 않도록 회색조(Grayscale)를 유지하면서 감마 보정으로 연한 글씨를 진하게 살림
             gamma = 0.65
             invGamma = 1.0 / gamma
             table = np.array([((i / 255.0) ** invGamma) * 255 for i in range(256)]).astype("uint8")
             gamma_corrected = cv2.LUT(enhanced, table)
             
-            # 언샤프 마스크(Unsharp Mask)로 글자 테두리를 깨끗하고 매끄럽게 정돈
             blurred_sharp = cv2.GaussianBlur(gamma_corrected, (0, 0), 1.0)
             final_gray = cv2.addWeighted(gamma_corrected, 1.4, blurred_sharp, -0.4, 0)
         else:
@@ -223,7 +272,7 @@ if file_configs:
                 c = canvas.Canvas(output_pdf_path, pagesize=A4)
 
                 for img_np in all_images:
-                    pil_img = smart_enhance_image_np(img_np, remove_bleed, enhance_faint_text)
+                    pil_img = smart_enhance_image_np(img_np, remove_bleed, enhance_faint_text, correct_perspective)
                     base_margin = 0
                     usable_width = a4_width - (base_margin * 2)
                     usable_height = a4_height - (base_margin * 2)
