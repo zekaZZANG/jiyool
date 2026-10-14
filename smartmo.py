@@ -1,286 +1,415 @@
-import streamlit as st
-import cv2
-import numpy as np
-from PIL import Image
-import fitz  # PyMuPDF
-import os
 import io
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
+import math
+import os
+import tempfile
+import zipfile
+from pathlib import Path
 
-# 페이지 설정
+import cv2
+import fitz
+import numpy as np
+import pytesseract
+import streamlit as st
+from PIL import Image, ImageDraw, ImageFont
+from pytesseract import Output
+
+
 st.set_page_config(
-    page_title="권지율의 스마트 모의고사 파일 수정 프로그램",
-    page_icon="📚",
-    layout="centered"
+    page_title="Exam PDF Restorer",
+    page_icon="📄",
+    layout="wide",
 )
 
-# [UI 디자인] 동글동글하고 산뜻한 하늘색 테마 커스텀 CSS 적용
-st.markdown("""
-    <style>
-    .stButton>button {
-        background-color: #0ea5e9;
-        color: white;
-        border-radius: 14px;
-        font-weight: bold;
-        height: 50px;
-        width: 100%;
-        border: none;
-    }
-    .stButton>button:hover {
-        background-color: #0284c7;
-        color: white;
-    }
-    </style>
-""", unsafe_allow_html=True)
-
-st.title("✨ 권지율의 스마트 모의고사 파일 수정 프로그램")
-st.write("웹 브라우저에서 실행되어 **PC나 스마트폰 어디서든** 접속해 시험지 파일을 완벽하게 보정합니다!")
-
-# 📱 모바일 브라우저에서 PDF 파일 비활성화 방지를 위해 type 제한 제거
-uploaded_files = st.file_uploader(
-    "📁 변환할 PDF 또는 이미지 파일들을 선택하거나 올려주세요", 
-    accept_multiple_files=True
+st.title("📄 Exam PDF Restorer")
+st.caption("스캔 시험지 PDF 복원 · OCR 기반 텍스트 재구성")
+st.warning(
+    "시험지 정확성 안내: 이미지 복원 모드는 원본 내용을 보존하는 데 초점을 둡니다. "
+    "OCR 재구성 모드는 인식 오류가 생길 수 있으며 수식·도형·표를 완벽하게 재현하지 못합니다. "
+    "중요한 시험지는 반드시 원본과 결과를 대조하세요."
 )
 
-file_configs = []
 
-if uploaded_files:
-    st.markdown("---")
-    st.markdown("### 📁 파일별 페이지 범위 설정")
-    
-    for idx, uploaded_file in enumerate(uploaded_files):
-        file_bytes = uploaded_file.read()
-        file_name = uploaded_file.name
-        ext = os.path.splitext(file_name)[1].lower()
+# ---------- Image processing helpers ----------
 
-        if ext not in ['.pdf', '.jpg', '.jpeg', '.png', '.bmp']:
-            st.warning(f"⚠️ '{file_name}'은(는) 지원하지 않는 형식입니다. (PDF, JPG, PNG만 가능)")
+def render_page(page, dpi=250):
+    scale = dpi / 72.0
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    if pix.n == 4:
+        arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
+    return arr
+
+
+def estimate_skew_angle(gray):
+    # Estimate small rotation from dark pixels; avoid extreme correction.
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 1800, threshold=max(50, min(gray.shape) // 8),
+        minLineLength=max(40, gray.shape[1] // 8), maxLineGap=12
+    )
+    if lines is None:
+        return 0.0
+    angles = []
+    for line in lines[:, 0]:
+        x1, y1, x2, y2 = map(int, line)
+        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+        if -15 <= angle <= 15:
+            angles.append(angle)
+    if not angles:
+        return 0.0
+    return float(np.median(angles))
+
+
+def rotate_bound(image, angle):
+    h, w = image.shape[:2]
+    center = (w / 2, h / 2)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    cos = abs(matrix[0, 0])
+    sin = abs(matrix[0, 1])
+    new_w = int((h * sin) + (w * cos))
+    new_h = int((h * cos) + (w * sin))
+    matrix[0, 2] += (new_w / 2) - center[0]
+    matrix[1, 2] += (new_h / 2) - center[1]
+    return cv2.warpAffine(
+        image, matrix, (new_w, new_h),
+        flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(255, 255, 255)
+    )
+
+
+def detect_and_warp_paper(image):
+    h, w = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    # Use a blurred edge map to find a large quadrilateral, if present.
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 30, 100)
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
+    for contour in contours:
+        perimeter = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+        if len(approx) == 4 and cv2.contourArea(approx) > 0.35 * h * w:
+            pts = approx.reshape(4, 2).astype(np.float32)
+            # Order points: top-left, top-right, bottom-right, bottom-left.
+            s = pts.sum(axis=1)
+            d = np.diff(pts, axis=1).reshape(-1)
+            rect = np.array([
+                pts[np.argmin(s)], pts[np.argmin(d)],
+                pts[np.argmax(s)], pts[np.argmax(d)]
+            ], dtype=np.float32)
+            tl, tr, br, bl = rect
+            width = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
+            height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
+            if width < 100 or height < 100:
+                continue
+            dst = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], dtype=np.float32)
+            transform = cv2.getPerspectiveTransform(rect, dst)
+            return cv2.warpPerspective(
+                image, transform, (width, height), flags=cv2.INTER_CUBIC,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255)
+            )
+    return image
+
+
+def normalize_background(image, strength=0.7):
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    # Estimate slowly varying paper illumination. Keep dark text detail.
+    kernel_size = max(31, (min(gray.shape[:2]) // 12) | 1)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    background = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
+    background = np.maximum(background, 20).astype(np.float32)
+    corrected = gray.astype(np.float32) * (245.0 / background)
+    corrected = np.clip(corrected, 0, 255)
+    # Blend original luminance with correction to avoid overprocessing.
+    out = gray.astype(np.float32) * (1 - strength) + corrected * strength
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    # Preserve subtle anti-aliasing instead of hard thresholding.
+    return cv2.cvtColor(out, cv2.COLOR_GRAY2RGB)
+
+
+def process_image(image, settings):
+    result = image.copy()
+    if settings["perspective"]:
+        result = detect_and_warp_paper(result)
+    if settings["deskew"]:
+        gray = cv2.cvtColor(result, cv2.COLOR_RGB2GRAY)
+        angle = estimate_skew_angle(gray)
+        if abs(angle) >= 0.15:
+            result = rotate_bound(result, -angle)
+    if settings["background"]:
+        result = normalize_background(result, settings["background_strength"])
+    if settings["denoise"]:
+        result = cv2.fastNlMeansDenoisingColored(result, None, 4, 4, 7, 21)
+    if settings["sharpen"]:
+        blurred = cv2.GaussianBlur(result, (0, 0), 1.1)
+        result = cv2.addWeighted(result, 1.35, blurred, -0.35, 0)
+    if settings["contrast"]:
+        lab = cv2.cvtColor(result, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        result = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2RGB)
+    return result
+
+
+# ---------- OCR reconstruction helpers ----------
+
+def find_korean_font():
+    candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def ocr_reconstruct(image, lang="kor+eng", threshold=45):
+    """
+    Experimental text-first reconstruction:
+    detects OCR word boxes and redraws recognized text on a white canvas.
+    This does not faithfully reconstruct equations, diagrams, tables or page design.
+    """
+    pil = Image.fromarray(image).convert("RGB")
+    data = pytesseract.image_to_data(pil, lang=lang, output_type=Output.DICT, config="--psm 3")
+    font_path = find_korean_font()
+    canvas = Image.new("RGB", pil.size, "white")
+    draw = ImageDraw.Draw(canvas)
+    low_confidence = 0
+    drawn = 0
+
+    n = len(data["text"])
+    for i in range(n):
+        text = (data["text"][i] or "").strip()
+        try:
+            conf = float(data["conf"][i])
+        except (ValueError, TypeError):
+            conf = -1
+        if not text or conf < threshold:
+            if text:
+                low_confidence += 1
             continue
+        x, y, w, h = [int(data[k][i]) for k in ("left", "top", "width", "height")]
+        if w <= 0 or h <= 0:
+            continue
+        # Tesseract boxes can be word-level; fit a font to the box height.
+        font_size = max(8, min(96, int(h * 0.82)))
+        try:
+            font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
+        except OSError:
+            font = ImageFont.load_default()
+        # Render a word at approximate original location. OCR font metrics differ.
+        draw.text((x, y), text, fill=(0, 0, 0), font=font, stroke_width=0)
+        drawn += 1
 
-        max_pages = 1
-        if ext == '.pdf':
-            try:
-                doc = fitz.open(stream=file_bytes, filetype="pdf")
-                max_pages = len(doc)
-                doc.close()
-            except:
-                max_pages = 1
+    return np.array(canvas), {"drawn_words": drawn, "low_confidence_words": low_confidence}
 
-        with st.container():
-            st.write(f"📄 **{file_name}** (총 {max_pages}쪽)")
-            col1, col2 = st.columns(2)
-            with col1:
-                start_page = st.number_input(
-                    "시작 페이지", min_value=1, max_value=max_pages, value=1, key=f"start_{idx}_{file_name}"
+
+def images_to_pdf(images, page_sizes=None):
+    output = fitz.open()
+    for idx, image in enumerate(images):
+        h, w = image.shape[:2]
+        if page_sizes and idx < len(page_sizes):
+            page_w, page_h = page_sizes[idx]
+        else:
+            # Use pixel aspect ratio and a standard A4-like page.
+            page_w, page_h = 595.0, 842.0
+            ratio = w / max(h, 1)
+            if ratio > page_w / page_h:
+                page_h = page_w / ratio
+        page = output.new_page(width=page_w, height=page_h)
+        png = Image.fromarray(image).convert("RGB")
+        buffer = io.BytesIO()
+        png.save(buffer, format="PNG", optimize=True)
+        page.insert_image(page.rect, stream=buffer.getvalue())
+    data = output.tobytes(deflate=True, garbage=4)
+    output.close()
+    return data
+
+
+def make_pdf_from_images(images, original_doc, original_page_indices):
+    output = fitz.open()
+    for image, page_idx in zip(images, original_page_indices):
+        original_page = original_doc[page_idx]
+        page = output.new_page(width=original_page.rect.width, height=original_page.rect.height)
+        buffer = io.BytesIO()
+        Image.fromarray(image).convert("RGB").save(buffer, format="PNG", optimize=True)
+        page.insert_image(page.rect, stream=buffer.getvalue())
+    result = output.tobytes(deflate=True, garbage=4)
+    output.close()
+    return result
+
+
+def get_pdf_bytes(uploaded_file):
+    return uploaded_file.getvalue()
+
+
+# ---------- UI ----------
+
+uploaded_files = st.file_uploader(
+    "PDF 파일을 업로드하세요 (여러 파일 선택 가능)",
+    type=["pdf"],
+    accept_multiple_files=True,
+)
+
+if not uploaded_files:
+    st.info("PDF를 업로드하면 파일별 페이지 범위와 복원 옵션을 설정할 수 있습니다.")
+    st.markdown(
+        "**권장 사용 순서**\n"
+        "1. PDF 업로드 → 2. 처리할 파일 선택 → 3. 페이지 범위와 옵션 지정 → "
+        "4. 미리보기 → 5. 결과 PDF 생성 및 다운로드"
+    )
+    st.stop()
+
+file_names = [f.name for f in uploaded_files]
+selected_name = st.selectbox("설정할 파일 선택", file_names)
+selected_file = next(f for f in uploaded_files if f.name == selected_name)
+pdf_bytes = get_pdf_bytes(selected_file)
+
+try:
+    source_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+except Exception as exc:
+    st.error(f"PDF를 열 수 없습니다: {exc}")
+    st.stop()
+
+page_count = len(source_doc)
+st.write(f"**{selected_name}** · 총 {page_count}페이지")
+
+left, right = st.columns(2)
+with left:
+    start_page = st.number_input("시작 페이지", min_value=1, max_value=page_count, value=1, step=1)
+with right:
+    end_page = st.number_input("끝 페이지", min_value=1, max_value=page_count, value=page_count, step=1)
+
+if end_page < start_page:
+    st.error("끝 페이지는 시작 페이지보다 작을 수 없습니다.")
+    st.stop()
+
+st.subheader("출력 모드")
+mode = st.radio(
+    "처리 방식",
+    ["이미지 복원", "OCR 텍스트 재구성 (실험적)"],
+    horizontal=True,
+    help="OCR 재구성은 인식된 텍스트를 흰 페이지에 다시 그립니다. 수식·그림·표의 정확한 재현을 보장하지 않습니다."
+)
+
+st.subheader("복원 기능")
+c1, c2, c3 = st.columns(3)
+with c1:
+    deskew = st.checkbox("기울기 보정", value=True)
+    perspective = st.checkbox("종이 원근/영역 보정", value=False)
+with c2:
+    background = st.checkbox("배경 백색화", value=True)
+    denoise = st.checkbox("노이즈 제거", value=True)
+with c3:
+    sharpen = st.checkbox("글자 선명도 개선", value=True)
+    contrast = st.checkbox("명암 개선", value=False)
+
+background_strength = st.slider("배경 보정 강도", min_value=0.0, max_value=1.0, value=0.65, step=0.05)
+dpi = st.select_slider("처리 해상도 (DPI)", options=[150, 200, 250, 300, 350], value=250)
+
+if mode.startswith("OCR"):
+    st.info(
+        "실험적 OCR 모드: Tesseract가 인식한 텍스트만 재배치하므로 원본의 도형, 그래프, 수식 레이아웃이 "
+        "사라지거나 인식 오류가 생길 수 있습니다. 결과를 반드시 확인하세요."
+    )
+    ocr_lang = st.selectbox("OCR 언어", ["kor+eng", "kor", "eng"], index=0)
+    confidence_threshold = st.slider("최소 OCR 신뢰도", 0, 90, 35, 5)
+else:
+    ocr_lang = "kor+eng"
+    confidence_threshold = 35
+
+st.divider()
+st.subheader("미리보기")
+preview_page_num = st.number_input(
+    "미리 볼 페이지", min_value=int(start_page), max_value=int(end_page),
+    value=int(start_page), step=1
+)
+
+settings = {
+    "deskew": deskew,
+    "perspective": perspective,
+    "background": background,
+    "background_strength": background_strength,
+    "denoise": denoise,
+    "sharpen": sharpen,
+    "contrast": contrast,
+}
+
+preview_col1, preview_col2 = st.columns(2)
+try:
+    preview_image = render_page(source_doc[int(preview_page_num) - 1], dpi=min(dpi, 200))
+    preview_result = process_image(preview_image, settings)
+    if mode.startswith("OCR"):
+        preview_result, preview_stats = ocr_reconstruct(
+            preview_result, lang=ocr_lang, threshold=confidence_threshold
+        )
+    with preview_col1:
+        st.markdown("**원본**")
+        st.image(preview_image, use_container_width=True)
+    with preview_col2:
+        st.markdown("**처리 결과 미리보기**")
+        st.image(preview_result, use_container_width=True)
+        if mode.startswith("OCR"):
+            st.caption(
+                f"인식 단어: {preview_stats['drawn_words']} · "
+                f"저신뢰 단어 제외: {preview_stats['low_confidence_words']}"
+            )
+except Exception as exc:
+    st.error(f"미리보기를 생성하지 못했습니다: {exc}")
+
+st.divider()
+st.subheader("PDF 생성")
+
+if st.button("선택한 페이지 처리 및 PDF 생성", type="primary", use_container_width=True):
+    selected_indices = list(range(int(start_page) - 1, int(end_page)))
+    result_images = []
+    result_page_sizes = []
+    progress = st.progress(0)
+    status = st.empty()
+    failures = []
+
+    for idx, page_idx in enumerate(selected_indices):
+        status.write(f"페이지 처리 중: {page_idx + 1}/{end_page}")
+        try:
+            image = render_page(source_doc[page_idx], dpi=dpi)
+            image = process_image(image, settings)
+            if mode.startswith("OCR"):
+                image, stats = ocr_reconstruct(
+                    image, lang=ocr_lang, threshold=confidence_threshold
                 )
-            with col2:
-                end_page = st.number_input(
-                    "끝 페이지", min_value=1, max_value=max_pages, value=max_pages, key=f"end_{idx}_{file_name}"
-                )
-            st.markdown("")
+            result_images.append(image)
+            page = source_doc[page_idx]
+            result_page_sizes.append((page.rect.width, page.rect.height))
+        except Exception as exc:
+            failures.append((page_idx + 1, str(exc)))
+            # Fallback: keep a rendered original rather than silently dropping a page.
+            result_images.append(render_page(source_doc[page_idx], dpi=dpi))
+            page = source_doc[page_idx]
+            result_page_sizes.append((page.rect.width, page.rect.height))
+        progress.progress((idx + 1) / len(selected_indices))
 
-        file_configs.append({
-            'bytes': file_bytes,
-            'ext': ext,
-            'max_pages': max_pages,
-            'start': int(start_page),
-            'end': int(end_page)
-        })
+    result_pdf = make_pdf_from_images(result_images, source_doc, selected_indices)
+    status.success(f"완료: {len(result_images)}페이지 처리")
+    if failures:
+        st.warning("일부 페이지는 처리 중 오류가 발생하여 원본 렌더링으로 대체했습니다.")
+        for page_no, message in failures:
+            st.write(f"- {page_no}페이지: {message}")
 
-# 옵션 체크박스 영역
-st.markdown("---")
-col_opt1, col_opt2 = st.columns(2)
-with col_opt1:
-    remove_bleed = st.checkbox("✨ 뒷면 비침 해결", value=True)
-with col_opt2:
-    straighten_top_line_opt = st.checkbox("📐 상단 가로선 기준 반듯하게 펴기", value=True)
+    base_name = Path(selected_name).stem
+    suffix = "restored" if mode == "이미지 복원" else "ocr_reconstructed_experimental"
+    output_name = f"{base_name}_{start_page}-{end_page}_{suffix}.pdf"
+    st.download_button(
+        "📥 결과 PDF 다운로드",
+        data=result_pdf,
+        file_name=output_name,
+        mime="application/pdf",
+        use_container_width=True,
+    )
+    st.success("결과 PDF가 준비되었습니다. 저장한 뒤 원본과 페이지별로 비교해 주세요.")
 
-def straighten_exam_by_top_line(img):
-    """시험지 상단 영역의 가로선을 탐지하여 기울어진 각도를 계산하고 수평으로 맞춥니다."""
-    try:
-        h, w = img.shape[:2]
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        # 상단 35% 영역에서 가로선 탐색
-        top_region = gray[0:int(h * 0.35), :]
-        edges = cv2.Canny(top_region, 50, 150, apertureSize=3)
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=int(w * 0.3), maxLineGap=20)
-        
-        angles = []
-        if lines is not None:
-            for line in lines:
-                for x1, y1, x2, y2 in line:
-                    if x2 - x1 != 0:
-                        angle = np.arctan2(y2 - y1, x2 - x1) * 180.0 / np.pi
-                        if abs(angle) < 15:  # 수평에 가까운 선만 추출
-                            angles.append(angle)
-                            
-        if angles:
-            median_angle = np.median(angles)
-            if abs(median_angle) > 0.3:  # 0.3도 이상 틀어졌을 때만 회전
-                center = (w // 2, h // 2)
-                M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
-                img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
-    except Exception:
-        pass
-    return img
-
-def crop_and_align_paper(img):
-    """불필요한 바깥 여백을 자르고, 가로형 2페이지 스프레드일 때만 중앙 제본선 정렬 적용"""
-    try:
-        h, w = img.shape[:2]
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if contours:
-            largest_contour = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(largest_contour)
-            if area > (h * w * 0.25):
-                x, y, bw, bh = cv2.boundingRect(largest_contour)
-                inset = 8
-                x = max(0, x + inset)
-                y = max(0, y + inset)
-                bw = min(w - x, bw - (inset * 2))
-                bh = min(h - y, bh - (inset * 2))
-                
-                if bw > w * 0.4 and bh > h * 0.4:
-                    img = img[y:y+bh, x:x+bw]
-
-        h2, w2 = img.shape[:2]
-        if w2 > h2 * 1.1:
-            gray2 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            mid_band = gray2[int(h2 * 0.2):int(h2 * 0.8), :]
-            col_sums = np.sum(mid_band, axis=0)
-            
-            search_start = int(w2 * 0.4)
-            search_end = int(w2 * 0.6)
-            
-            if search_start < search_end:
-                trough_x = search_start + np.argmin(col_sums[search_start:search_end])
-                target_x = w2 // 2
-                shift = target_x - trough_x
-                
-                if abs(shift) > 5:
-                    M = np.float32([[1, 0, shift], [0, 1, 0]])
-                    img = cv2.warpAffine(img, M, (w2, h2), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
-    except Exception:
-        pass
-    return img
-
-def smart_enhance_image_np(img, remove_bleed=True, straighten_top=True):
-    """스마트 크롭, 상단선 기준 기울기 보정, 비침 해결 및 고화질 잉크 보정"""
-    try:
-        if straighten_top:
-            img = straighten_exam_by_top_line(img)
-            
-        img = crop_and_align_paper(img)
-
-        h, w = img.shape[:2]
-        gray_crop = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        if remove_bleed:
-            kernel_bleed = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
-            bg_bleed = cv2.morphologyEx(gray_crop, cv2.MORPH_CLOSE, kernel_bleed)
-            diff = cv2.absdiff(bg_bleed, gray_crop)
-            gray_crop[diff < 18] = 255
-
-        kernel_bg = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
-        bg = cv2.morphologyEx(gray_crop, cv2.MORPH_CLOSE, kernel_bg)
-        normalized = cv2.divide(gray_crop, bg, scale=255)
-
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-        enhanced = clahe.apply(normalized)
-
-        gamma = 0.70
-        invGamma = 1.0 / gamma
-        table = np.array([((i / 255.0) ** invGamma) * 255 for i in range(256)]).astype("uint8")
-        gamma_corrected = cv2.LUT(enhanced, table)
-
-        final_gray = cv2.bilateralFilter(gamma_corrected, d=5, sigmaColor=30, sigmaSpace=30)
-        final_img = cv2.cvtColor(final_gray, cv2.COLOR_GRAY2BGR)
-        
-        return Image.fromarray(final_img)
-    except Exception:
-        return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR))
-
-if file_configs:
-    if st.button("🚀 웹에서 초고속 PDF 생성하기"):
-        with st.spinner("시험지 보정 및 PDF 생성 중입니다... 잠시만 기다려주세요!"):
-            all_images = []
-            
-            for config in file_configs:
-                file_bytes = config['bytes']
-                ext = config['ext']
-                max_pages = config['max_pages']
-                s_val = config['start']
-                e_val = config['end']
-
-                s_idx = max(0, s_val - 1)
-                e_idx = min(max_pages - 1, e_val - 1)
-                
-                if s_idx <= e_idx:
-                    pages_to_process = list(range(s_idx, e_idx + 1))
-                else:
-                    pages_to_process = [s_idx]
-
-                if ext == '.pdf':
-                    doc = fitz.open(stream=file_bytes, filetype="pdf")
-                    for page_index in pages_to_process:
-                        page = doc[page_index]
-                        pix = page.get_pixmap(dpi=150)
-                        img_np = cv2.imdecode(np.frombuffer(pix.tobytes("png"), np.uint8), cv2.IMREAD_COLOR)
-                        if img_np is not None:
-                            all_images.append(img_np)
-                    doc.close()
-                elif ext in ['.jpg', '.jpeg', '.png', '.bmp']:
-                    img_np = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
-                    if img_np is not None:
-                        all_images.append(img_np)
-
-            if len(all_images) > 0:
-                output_pdf_path = "권지율의_모의고사_완성.pdf"
-                a4_width, a4_height = A4
-                c = canvas.Canvas(output_pdf_path, pagesize=A4)
-
-                for img_np in all_images:
-                    pil_img = smart_enhance_image_np(img_np, remove_bleed, straighten_top_line_opt)
-                    base_margin = 0
-                    usable_width = a4_width - (base_margin * 2)
-                    usable_height = a4_height - (base_margin * 2)
-                    
-                    img_w, img_h = pil_img.size
-                    aspect = img_h / img_w
-                    
-                    draw_width = usable_width
-                    draw_height = usable_width * aspect
-                    
-                    if draw_height > usable_height:
-                        draw_height = usable_height
-                        draw_width = usable_height / aspect
-
-                    x = base_margin + (usable_width - draw_width) / 2
-                    y = a4_height - base_margin - draw_height
-
-                    c.drawImage(ImageReader(pil_img), x, y, width=draw_width, height=draw_height)
-                    c.showPage()
-
-                c.save()
-
-                with open(output_pdf_path, "rb") as f:
-                    pdf_data = f.read()
-
-                st.success("변환이 성공적으로 완료되었습니다!")
-                
-                st.download_button(
-                    label="📥 완성된 모의고사 PDF 다운로드",
-                    data=pdf_data,
-                    file_name="권지율의_모의고사_완성.pdf",
-                    mime="application/pdf"
-                )
-            else:
-                st.warning("처리할 수 있는 유효한 파일이나 페이지가 없습니다.")
+source_doc.close()
