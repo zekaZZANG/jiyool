@@ -93,9 +93,9 @@ if uploaded_files:
 st.markdown("---")
 col_opt1, col_opt2 = st.columns(2)
 with col_opt1:
-    remove_bleed = st.checkbox("✨ 선명도 및 가독성 향상", value=True)
+    remove_bleed = st.checkbox("✨ 뒷면 비침 해결", value=True)
 with col_opt2:
-    straighten_top_line_opt = st.checkbox("📐 상단 가로선 기준 수평 맞춤", value=False)
+    straighten_top_line_opt = st.checkbox("📐 상단 가로선 기준 반듯하게 펴기", value=True)
 
 def straighten_exam_by_top_line(img):
     """시험지 상단 영역의 가로선을 탐지하여 기울어진 각도를 계산하고 수평으로 맞춥니다."""
@@ -103,6 +103,7 @@ def straighten_exam_by_top_line(img):
         h, w = img.shape[:2]
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
+        # 상단 35% 영역에서 가로선 탐색
         top_region = gray[0:int(h * 0.35), :]
         edges = cv2.Canny(top_region, 50, 150, apertureSize=3)
         lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=int(w * 0.3), maxLineGap=20)
@@ -113,12 +114,12 @@ def straighten_exam_by_top_line(img):
                 for x1, y1, x2, y2 in line:
                     if x2 - x1 != 0:
                         angle = np.arctan2(y2 - y1, x2 - x1) * 180.0 / np.pi
-                        if abs(angle) < 15:
+                        if abs(angle) < 15:  # 수평에 가까운 선만 추출
                             angles.append(angle)
                             
         if angles:
             median_angle = np.median(angles)
-            if abs(median_angle) > 0.2:
+            if abs(median_angle) > 0.3:  # 0.3도 이상 틀어졌을 때만 회전
                 center = (w // 2, h // 2)
                 M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
                 img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
@@ -141,7 +142,7 @@ def crop_and_align_paper(img):
             area = cv2.contourArea(largest_contour)
             if area > (h * w * 0.25):
                 x, y, bw, bh = cv2.boundingRect(largest_contour)
-                inset = 4
+                inset = 8
                 x = max(0, x + inset)
                 y = max(0, y + inset)
                 bw = min(w - x, bw - (inset * 2))
@@ -171,30 +172,45 @@ def crop_and_align_paper(img):
         pass
     return img
 
-def safe_high_fidelity_enhance(img, enhance=True, straighten_top=False):
-    """수식, 폰트, 기호를 100% 보존하면서 깔끔하게 렌더링하는 비파괴 고화질 보정 함수"""
+def smart_enhance_image_np(img, remove_bleed=True, straighten_top=True):
+    """스마트 크롭, 상단선 기준 기울기 보정, 비침 해결 및 고화질 잉크 보정"""
     try:
         if straighten_top:
             img = straighten_exam_by_top_line(img)
             
         img = crop_and_align_paper(img)
 
-        if enhance:
-            # 글자를 뭉개는 강한 이진화 대신, 부드러운 CLAHE 명암비 조절과 양방향 필터로 가독성만 높임
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(8, 8))
-            enhanced = clahe.apply(gray)
-            smoothed = cv2.bilateralFilter(enhanced, d=3, sigmaColor=15, sigmaSpace=15)
-            final_img = cv2.cvtColor(smoothed, cv2.COLOR_GRAY2BGR)
-            return Image.fromarray(final_img)
-        else:
-            return Image.fromarray(img)
+        h, w = img.shape[:2]
+        gray_crop = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        if remove_bleed:
+            kernel_bleed = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
+            bg_bleed = cv2.morphologyEx(gray_crop, cv2.MORPH_CLOSE, kernel_bleed)
+            diff = cv2.absdiff(bg_bleed, gray_crop)
+            gray_crop[diff < 18] = 255
+
+        kernel_bg = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
+        bg = cv2.morphologyEx(gray_crop, cv2.MORPH_CLOSE, kernel_bg)
+        normalized = cv2.divide(gray_crop, bg, scale=255)
+
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        enhanced = clahe.apply(normalized)
+
+        gamma = 0.70
+        invGamma = 1.0 / gamma
+        table = np.array([((i / 255.0) ** invGamma) * 255 for i in range(256)]).astype("uint8")
+        gamma_corrected = cv2.LUT(enhanced, table)
+
+        final_gray = cv2.bilateralFilter(gamma_corrected, d=5, sigmaColor=30, sigmaSpace=30)
+        final_img = cv2.cvtColor(final_gray, cv2.COLOR_GRAY2BGR)
+        
+        return Image.fromarray(final_img)
     except Exception:
         return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR))
 
 if file_configs:
-    if st.button("🚀 수식 깨짐 없는 고화질 PDF 생성"):
-        with st.spinner("수식과 폰트를 완벽하게 보존하며 PDF 생성 중입니다... 잠시만 기다려주세요!"):
+    if st.button("🚀 웹에서 초고속 PDF 생성하기"):
+        with st.spinner("시험지 보정 및 PDF 생성 중입니다... 잠시만 기다려주세요!"):
             all_images = []
             
             for config in file_configs:
@@ -216,8 +232,7 @@ if file_configs:
                     doc = fitz.open(stream=file_bytes, filetype="pdf")
                     for page_index in pages_to_process:
                         page = doc[page_index]
-                        # 300 DPI 초고해상도 렌더링 유지
-                        pix = page.get_pixmap(dpi=300)
+                        pix = page.get_pixmap(dpi=150)
                         img_np = cv2.imdecode(np.frombuffer(pix.tobytes("png"), np.uint8), cv2.IMREAD_COLOR)
                         if img_np is not None:
                             all_images.append(img_np)
@@ -228,12 +243,12 @@ if file_configs:
                         all_images.append(img_np)
 
             if len(all_images) > 0:
-                output_pdf_path = "권지율의_불꽃모의고사_완벽보존.pdf"
+                output_pdf_path = "권지율의_모의고사_완성.pdf"
                 a4_width, a4_height = A4
                 c = canvas.Canvas(output_pdf_path, pagesize=A4)
 
                 for img_np in all_images:
-                    pil_img = safe_high_fidelity_enhance(img_np, remove_bleed, straighten_top_line_opt)
+                    pil_img = smart_enhance_image_np(img_np, remove_bleed, straighten_top_line_opt)
                     base_margin = 0
                     usable_width = a4_width - (base_margin * 2)
                     usable_height = a4_height - (base_margin * 2)
@@ -259,12 +274,12 @@ if file_configs:
                 with open(output_pdf_path, "rb") as f:
                     pdf_data = f.read()
 
-                st.success("✨ 수식 깨짐 없이 완벽하게 변환되었습니다!")
+                st.success("변환이 성공적으로 완료되었습니다!")
                 
                 st.download_button(
-                    label="📥 완벽 보존된 모의고사 PDF 다운로드",
+                    label="📥 완성된 모의고사 PDF 다운로드",
                     data=pdf_data,
-                    file_name="권지율의_불꽃모의고사_완벽보존.pdf",
+                    file_name="권지율의_모의고사_완성.pdf",
                     mime="application/pdf"
                 )
             else:
