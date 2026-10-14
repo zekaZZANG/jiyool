@@ -38,10 +38,9 @@ st.markdown("""
 st.title("✨ 권지율의 스마트 모의고사 파일 수정 프로그램")
 st.write("웹 브라우저에서 실행되어 **PC나 스마트폰 어디서든** 접속해 시험지 파일을 완벽하게 보정합니다!")
 
-# 파일 업로드 컴포넌트
+# 📱 모바일 브라우저에서 PDF 파일 비활성화 방지를 위해 type 제한을 제거했습니다.
 uploaded_files = st.file_uploader(
     "📁 변환할 PDF 또는 이미지 파일들을 선택하거나 올려주세요", 
-    type=["pdf", "jpg", "jpeg", "png", "bmp"], 
     accept_multiple_files=True
 )
 
@@ -56,6 +55,11 @@ if uploaded_files:
         file_name = uploaded_file.name
         ext = os.path.splitext(file_name)[1].lower()
 
+        # 지원하지 않는 파일 형식인 경우 건너뛰기
+        if ext not in ['.pdf', '.jpg', '.jpeg', '.png', '.bmp']:
+            st.warning(f"⚠️ '{file_name}'은(는) 지원하지 않는 형식입니다. (PDF, JPG, PNG만 가능)")
+            continue
+
         max_pages = 1
         if ext == '.pdf':
             try:
@@ -65,7 +69,6 @@ if uploaded_files:
             except:
                 max_pages = 1
 
-        # 파일 카드 박스 UI 느낌으로 표시
         with st.container():
             st.write(f"📄 **{file_name}** (총 {max_pages}쪽)")
             col1, col2 = st.columns(2)
@@ -168,7 +171,7 @@ def smart_enhance_image_np(img, remove_bleed=True):
     except Exception:
         return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR))
 
-if uploaded_files:
+if file_configs:
     if st.button("🚀 웹에서 초고속 PDF 생성하기"):
         with st.spinner("시험지 보정 및 PDF 생성 중입니다... 잠시만 기다려주세요!"):
             all_images = []
