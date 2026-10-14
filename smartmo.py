@@ -38,7 +38,7 @@ st.markdown("""
 st.title("✨ 권지율의 스마트 모의고사 파일 수정 프로그램")
 st.write("웹 브라우저에서 실행되어 **PC나 스마트폰 어디서든** 접속해 시험지 파일을 완벽하게 보정합니다!")
 
-# 파일 업로드 컴포넌트 (모바일 비활성화 방지 위해 type 제한 제거)
+# 📱 모바일 브라우저에서 PDF 파일 비활성화 방지를 위해 type 제한 제거
 uploaded_files = st.file_uploader(
     "📁 변환할 PDF 또는 이미지 파일들을 선택하거나 올려주세요", 
     accept_multiple_files=True
@@ -89,68 +89,50 @@ if uploaded_files:
             'end': int(end_page)
         })
 
-# 보정 옵션 체크박스들
-remove_bleed = st.checkbox("✨ 뒷면 비침 해결 (뒷장 글씨를 하얗게 지우기)", value=True)
-enhance_faint_text = st.checkbox("✒️ 흐리고 연한 활자 진하게/선명하게 보정", value=True)
-correct_perspective = st.checkbox("📐 구겨진 시험지 왜곡 펴기 및 반듯하게 정렬", value=True)
+# 옵션 체크박스 영역
+st.markdown("---")
+col_opt1, col_opt2 = st.columns(2)
+with col_opt1:
+    remove_bleed = st.checkbox("✨ 뒷면 비침 해결", value=True)
+with col_opt2:
+    straighten_top_line_opt = st.checkbox("📐 상단 가로선 기준 반듯하게 펴기", value=True)
 
-def order_points(pts):
-    """네 모서리 좌표 순서 정렬 (좌상, 우상, 우하, 좌하)"""
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-def four_point_transform(image, pts):
-    """모서리 좌표를 바탕으로 왜곡된 종이를 반듯한 직사각형으로 투시 변환"""
-    rect = order_points(pts)
-    (tl, tr, br, bl) = rect
-
-    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-    maxWidth = max(int(widthA), int(widthB))
-
-    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-    maxHeight = max(int(heightA), int(heightB))
-
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]
-    ], dtype="float32")
-
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight), borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
-    return warped
-
-def crop_and_align_paper(img, correct_perspective=True):
-    """구겨진 시험지 투시 왜곡 펴기 + 여백 자르기 + 스프레드 정렬"""
+def straighten_exam_by_top_line(img):
+    """시험지 상단 영역의 가로선을 탐지하여 기울어진 각도를 계산하고 수평으로 맞춥니다."""
     try:
         h, w = img.shape[:2]
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # 상단 35% 영역에서 가로선 탐색
+        top_region = gray[0:int(h * 0.35), :]
+        edges = cv2.Canny(top_region, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=int(w * 0.3), maxLineGap=20)
+        
+        angles = []
+        if lines is not None:
+            for line in lines:
+                for x1, y1, x2, y2 in line:
+                    if x2 - x1 != 0:
+                        angle = np.arctan2(y2 - y1, x2 - x1) * 180.0 / np.pi
+                        if abs(angle) < 15:  # 수평에 가까운 선만 추출
+                            angles.append(angle)
+                            
+        if angles:
+            median_angle = np.median(angles)
+            if abs(median_angle) > 0.3:  # 0.3도 이상 틀어졌을 때만 회전
+                center = (w // 2, h // 2)
+                M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+                img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+    except Exception:
+        pass
+    return img
 
-        if correct_perspective and contours:
-            largest_contour = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(largest_contour)
-            if area > (h * w * 0.2):
-                peri = cv2.arcLength(largest_contour, True)
-                approx = cv2.approxPolyDP(largest_contour, 0.02 * peri, True)
-                if len(approx) == 4:
-                    pts = approx.reshape(4, 2)
-                    img = four_point_transform(img, pts)
-                    h, w = img.shape[:2]
-
-        # 바깥 여백 깔끔하게 정리
+def crop_and_align_paper(img):
+    """불필요한 바깥 여백을 자르고, 가로형 2페이지 스프레드일 때만 중앙 제본선 정렬 적용"""
+    try:
+        h, w = img.shape[:2]
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
         blurred = cv2.GaussianBlur(gray, (7, 7), 0)
         _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -169,7 +151,6 @@ def crop_and_align_paper(img, correct_perspective=True):
                 if bw > w * 0.4 and bh > h * 0.4:
                     img = img[y:y+bh, x:x+bw]
 
-        # 가로형 2페이지 스프레드 중앙 제본선 정렬
         h2, w2 = img.shape[:2]
         if w2 > h2 * 1.1:
             gray2 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -191,10 +172,13 @@ def crop_and_align_paper(img, correct_perspective=True):
         pass
     return img
 
-def smart_enhance_image_np(img, remove_bleed=True, enhance_faint_text=True, correct_perspective=True):
-    """스마트 보정 파이프라인 (왜곡 펴기 + 비침 해결 + 선명도 개선)"""
+def smart_enhance_image_np(img, remove_bleed=True, straighten_top=True):
+    """스마트 크롭, 상단선 기준 기울기 보정, 비침 해결 및 고화질 잉크 보정"""
     try:
-        img = crop_and_align_paper(img, correct_perspective)
+        if straighten_top:
+            img = straighten_exam_by_top_line(img)
+            
+        img = crop_and_align_paper(img)
 
         h, w = img.shape[:2]
         gray_crop = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -209,25 +193,17 @@ def smart_enhance_image_np(img, remove_bleed=True, enhance_faint_text=True, corr
         bg = cv2.morphologyEx(gray_crop, cv2.MORPH_CLOSE, kernel_bg)
         normalized = cv2.divide(gray_crop, bg, scale=255)
 
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         enhanced = clahe.apply(normalized)
 
-        if enhance_faint_text:
-            gamma = 0.65
-            invGamma = 1.0 / gamma
-            table = np.array([((i / 255.0) ** invGamma) * 255 for i in range(256)]).astype("uint8")
-            gamma_corrected = cv2.LUT(enhanced, table)
-            
-            blurred_sharp = cv2.GaussianBlur(gamma_corrected, (0, 0), 1.0)
-            final_gray = cv2.addWeighted(gamma_corrected, 1.4, blurred_sharp, -0.4, 0)
-        else:
-            gamma = 0.75
-            invGamma = 1.0 / gamma
-            table = np.array([((i / 255.0) ** invGamma) * 255 for i in range(256)]).astype("uint8")
-            gamma_corrected = cv2.LUT(enhanced, table)
-            final_gray = cv2.bilateralFilter(gamma_corrected, d=5, sigmaColor=30, sigmaSpace=30)
+        gamma = 0.70
+        invGamma = 1.0 / gamma
+        table = np.array([((i / 255.0) ** invGamma) * 255 for i in range(256)]).astype("uint8")
+        gamma_corrected = cv2.LUT(enhanced, table)
 
+        final_gray = cv2.bilateralFilter(gamma_corrected, d=5, sigmaColor=30, sigmaSpace=30)
         final_img = cv2.cvtColor(final_gray, cv2.COLOR_GRAY2BGR)
+        
         return Image.fromarray(final_img)
     except Exception:
         return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR))
@@ -272,7 +248,7 @@ if file_configs:
                 c = canvas.Canvas(output_pdf_path, pagesize=A4)
 
                 for img_np in all_images:
-                    pil_img = smart_enhance_image_np(img_np, remove_bleed, enhance_faint_text, correct_perspective)
+                    pil_img = smart_enhance_image_np(img_np, remove_bleed, straighten_top_line_opt)
                     base_margin = 0
                     usable_width = a4_width - (base_margin * 2)
                     usable_height = a4_height - (base_margin * 2)
